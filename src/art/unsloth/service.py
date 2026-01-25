@@ -95,8 +95,12 @@ async def process_train_batch(
     Yields tuples of (result, warmup_done) where warmup_done indicates if warmup just finished.
     """
     precalculate_logprobs = _config.get("precalculate_logprobs", False)
+    
+    # Get batch size from trainer config, default to 1 for backward compatibility
+    batch_size = trainer.args.per_device_train_batch_size if hasattr(trainer.args, 'per_device_train_batch_size') else 1
+    num_sequences = packed_tensors["tokens"].shape[0]
 
-    for offset in range(0, packed_tensors["tokens"].shape[0]):
+    for offset in range(0, num_sequences, batch_size):
         for _ in range(2 if warmup else 1):
             if precalculate_logprobs and not warmup:
                 # Preserve original logprobs before overwriting
@@ -107,7 +111,7 @@ async def process_train_batch(
                 precalculate_logprobs = False
 
             inputs_queue.put_nowait(
-                create_train_inputs(packed_tensors, offset, config, _config, warmup)
+                create_train_inputs(packed_tensors, offset, config, _config, warmup, batch_size)
             )
 
             # Wait for a result from the queue or for the training task to,

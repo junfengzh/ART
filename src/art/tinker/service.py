@@ -158,7 +158,7 @@ class TinkerService:
                         custom_loss_fn,
                         masks=masks,
                         inputs=create_train_inputs(
-                            packed_tensors, i, config, _config, False
+                            packed_tensors, i, config, _config, False, batch_size=1
                         ),
                     ),
                 )

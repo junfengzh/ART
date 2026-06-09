@@ -37,16 +37,34 @@ from ..preprocessing.pack import (
 )
 
 # Patch Tinker's Qwen3InstructRenderer which mistakenly expects "args" instead of "arguments" in tool calls.
-_parse_tool_call = renderers.Qwen3InstructRenderer._parse_tool_call
+#
+# Compatibility: tinker_cookbook >= 0.4.0 lazy-imports renderer classes
+# inside a function in ``renderers/__init__.py`` instead of re-exporting
+# them at module top-level, and Qwen3InstructRenderer dropped the
+# `_parse_tool_call` instance method (the parsing happens elsewhere now).
+# This patch needs to gracefully no-op in that world — we hit it from
+# ``model.delete_checkpoints()`` even on the unsloth (non-tinker) path
+# because backend imports TinkerService unconditionally.
+try:
+    from tinker_cookbook.renderers.qwen3 import (
+        Qwen3InstructRenderer as _Qwen3InstructRenderer,
+    )
+    renderers.Qwen3InstructRenderer = _Qwen3InstructRenderer
+    _parse_tool_call = getattr(_Qwen3InstructRenderer, "_parse_tool_call", None)
+except Exception:
+    _parse_tool_call = None
 
 
 def _patched_parse_tool_call(
     self, tool_call_str: str
 ) -> list[renderers.ToolCall] | None:
+    if _parse_tool_call is None:
+        return None
     return _parse_tool_call(self, tool_call_str.replace('"arguments": ', '"args": '))
 
 
-renderers.Qwen3InstructRenderer._parse_tool_call = _patched_parse_tool_call
+if _parse_tool_call is not None:
+    renderers.Qwen3InstructRenderer._parse_tool_call = _patched_parse_tool_call
 
 
 @contextmanager

@@ -95,49 +95,73 @@ async def process_train_batch(
     Yields tuples of (result, warmup_done) where warmup_done indicates if warmup just finished.
     """
     precalculate_logprobs = _config.get("precalculate_logprobs", False)
-    
+
     # Get batch size from trainer config, default to 1 for backward compatibility
     batch_size = trainer.args.per_device_train_batch_size if hasattr(trainer.args, 'per_device_train_batch_size') else 1
+    grad_accum = getattr(trainer.args, "gradient_accumulation_steps", 1) or 1
     num_sequences = packed_tensors["tokens"].shape[0]
 
-    for offset in range(0, num_sequences, batch_size):
-        for _ in range(2 if warmup else 1):
-            if precalculate_logprobs and not warmup:
-                # Preserve original logprobs before overwriting
-                packed_tensors["original_logprobs"] = packed_tensors["logprobs"]  # type: ignore
-                packed_tensors["logprobs"] = precalculate_new_logprobs(
-                    trainer, peft_model, packed_tensors, config, _config
-                )
-                precalculate_logprobs = False
+    # TRL's GRPOTrainer performs ONE optimizer step (and one log -> one entry on
+    # results_queue) per `grad_accum` micro-batches. The original loop put a
+    # single input then blocked for a result, which deadlocks whenever
+    # grad_accum > 1: the trainer can't produce a result until it has consumed a
+    # full accumulation group, but the feeder won't put the next input until it
+    # gets a result. Fix: feed a COMPLETE accumulation group of inputs before
+    # blocking for each result, and only feed complete groups (drop any
+    # remainder < grad_accum micro-batches) so no partial accumulation state
+    # leaks across train() calls. The gradient math is unchanged — TRL owns
+    # accumulation; we only correct the feeding cadence. grad_accum == 1 reduces
+    # to the original 1-input-1-result behaviour.
+    micro_offsets = list(range(0, num_sequences, batch_size))
+    n_groups = len(micro_offsets) // grad_accum
+    if n_groups == 0 and micro_offsets:
+        # Fewer micro-batches than grad_accum: pad by repeating offsets so we
+        # still take a single optimizer step rather than stalling.
+        micro_offsets = (micro_offsets * grad_accum)[:grad_accum]
+        n_groups = 1
 
-            inputs_queue.put_nowait(
-                create_train_inputs(packed_tensors, offset, config, _config, warmup, batch_size)
-            )
+    async def _await_result():
+        done, _ = await asyncio.wait(
+            [asyncio.create_task(results_queue.get()), train_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if verbose:
+            print("Done waiting for a result from the queue / training task")
+        for task in done:
+            result = task.result()
+            # If `result` is `None`, the training task finished somehow.
+            assert result is not None, "The training task should never finish."
+            results_queue.task_done()
+            return result
 
-            # Wait for a result from the queue or for the training task to,
-            # presumably, raise an exception
-            done, _ = await asyncio.wait(
-                [
-                    asyncio.create_task(results_queue.get()),
-                    train_task,
-                ],
-                return_when=asyncio.FIRST_COMPLETED,
+    def _put(offset: int, is_warmup: bool):
+        nonlocal precalculate_logprobs
+        if precalculate_logprobs and not is_warmup:
+            # Preserve original logprobs before overwriting (do this once).
+            packed_tensors["original_logprobs"] = packed_tensors["logprobs"]  # type: ignore
+            packed_tensors["logprobs"] = precalculate_new_logprobs(
+                trainer, peft_model, packed_tensors, config, _config
             )
-            if verbose:
-                print(
-                    "Done waiting for a result from the queue or for the training task to, presumably, raise an exception"
-                )
-            for task in done:
-                result = task.result()
-                # If `result` is `None`, the training task finished somehow.
-                assert result is not None, "The training task should never finish."
-                results_queue.task_done()
-                if warmup:
-                    gc_and_empty_cuda_cache()
-                    await asyncio.sleep(0.1)
-                    warmup = False
-                else:
-                    yield result
+            precalculate_logprobs = False
+        inputs_queue.put_nowait(
+            create_train_inputs(packed_tensors, offset, config, _config, is_warmup, batch_size)
+        )
+
+    # Warmup: feed one full accumulation group, discard its result.
+    if warmup:
+        for i in range(grad_accum):
+            _put(micro_offsets[i % len(micro_offsets)], True)
+        await _await_result()
+        gc_and_empty_cuda_cache()
+        await asyncio.sleep(0.1)
+        warmup = False
+
+    # Real training: feed complete groups, yield one result per optimizer step.
+    for grp in range(n_groups):
+        for j in range(grad_accum):
+            _put(micro_offsets[grp * grad_accum + j], False)
+        result = await _await_result()
+        yield result
 
 
 def save_checkpoint(

@@ -120,6 +120,19 @@ async def process_train_batch(
         micro_offsets = (micro_offsets * grad_accum)[:grad_accum]
         n_groups = 1
 
+    # ---- THROUGHPUT INSTRUMENTATION (find the step-7 85s/it stall) --------
+    import time as _t
+    try:
+        _devs: dict[str, int] = {}
+        for _p in peft_model.parameters():
+            _devs[str(_p.device)] = _devs.get(str(_p.device), 0) + 1
+        _seqlen = int(packed_tensors["tokens"].shape[1])
+    except Exception:
+        _devs, _seqlen = {}, -1
+    print(f"[instr] train batch: num_seq={num_sequences} seqlen={_seqlen} "
+          f"batch_size={batch_size} grad_accum={grad_accum} n_groups={n_groups} "
+          f"precalc={precalculate_logprobs} param_devices={_devs}", flush=True)
+
     async def _await_result():
         done, _ = await asyncio.wait(
             [asyncio.create_task(results_queue.get()), train_task],
@@ -139,13 +152,19 @@ async def process_train_batch(
         if precalculate_logprobs and not is_warmup:
             # Preserve original logprobs before overwriting (do this once).
             packed_tensors["original_logprobs"] = packed_tensors["logprobs"]  # type: ignore
+            _t0 = _t.time()
             packed_tensors["logprobs"] = precalculate_new_logprobs(
                 trainer, peft_model, packed_tensors, config, _config
             )
+            print(f"[instr] precalculate_new_logprobs took {_t.time()-_t0:.1f}s", flush=True)
             precalculate_logprobs = False
+        _tc = _t.time()
         inputs_queue.put_nowait(
             create_train_inputs(packed_tensors, offset, config, _config, is_warmup, batch_size)
         )
+        _dt = _t.time() - _tc
+        if _dt > 1.0:
+            print(f"[instr] create_train_inputs(offset={offset}) took {_dt:.1f}s", flush=True)
 
     # Warmup: feed one full accumulation group, discard its result.
     if warmup:
@@ -158,9 +177,14 @@ async def process_train_batch(
 
     # Real training: feed complete groups, yield one result per optimizer step.
     for grp in range(n_groups):
+        _tg = _t.time()
         for j in range(grad_accum):
             _put(micro_offsets[grp * grad_accum + j], False)
+        _tfed = _t.time()
         result = await _await_result()
+        _tdone = _t.time()
+        print(f"[instr] opt-step {grp+1}/{n_groups}: feed={_tfed-_tg:.1f}s "
+              f"compute+wait={_tdone-_tfed:.1f}s total={_tdone-_tg:.1f}s", flush=True)
         yield result
 
 

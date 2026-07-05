@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from itertools import takewhile
 import math
 import random
+import warnings
 from typing import Any, Generator, cast
 
 from PIL import Image
@@ -127,6 +128,40 @@ def tokenize_trajectory_groups(
 
 
 def tokenize_trajectory(
+    tokenizer: "PreTrainedTokenizerBase",
+    image_processor: BaseImageProcessor | None,
+    history: History,
+    advantage: float,
+    allow_training_without_logprobs: bool,
+) -> TokenizedResult | None:
+    """Tokenize a trajectory, returning None (skip) if it cannot be tokenized.
+
+    A single malformed final assistant turn can otherwise abort the ENTIRE
+    training batch. In particular, a temperature-sampled degenerate output whose
+    post-``</think>`` text confuses a reasoning model's chat template makes
+    ``tokenizer.apply_chat_template(continue_final_message=True)`` raise
+    "the final message does not appear in the chat after applying the chat
+    template". Since ``tokenize_trajectory_groups`` already drops ``None`` results
+    (and this function already returns ``None`` when there is nothing trainable),
+    the robust behavior is to skip just that one trajectory rather than crash.
+    """
+    try:
+        return _tokenize_trajectory_impl(
+            tokenizer,
+            image_processor,
+            history,
+            advantage,
+            allow_training_without_logprobs,
+        )
+    except Exception as e:
+        warnings.warn(
+            "tokenize_trajectory: skipping untokenizable trajectory: "
+            f"{type(e).__name__}: {e}"
+        )
+        return None
+
+
+def _tokenize_trajectory_impl(
     tokenizer: "PreTrainedTokenizerBase",
     image_processor: BaseImageProcessor | None,
     history: History,
